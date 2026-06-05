@@ -1,6 +1,6 @@
 {
 	"name": "retold-data-service",
-	"version": "2.1.4",
+	"version": "2.1.5",
 	"description": "Serve up a whole model!",
 	"main": "source/Retold-Data-Service.js",
 	"bin": {
@@ -80,34 +80,34 @@
 		"jsdom": "^25.0.1",
 		"meadow-connection-sqlite": "^1.0.20",
 		"mocha": "^11.0.1",
-		"pict-docuserve": "^1.4.4",
+		"pict-docuserve": "^1.4.19",
 		"puppeteer": "^24.40.0",
 		"quackage": "^1.3.0",
-		"stricture": "^4.0.3",
+		"stricture": "^4.0.6",
 		"supertest": "^7.2.2"
 	},
 	"dependencies": {
 		"bibliograph": "^1.0.0",
 		"fable": "^3.1.75",
 		"fable-serviceproviderbase": "^3.0.19",
-		"meadow": "^2.0.39",
-		"meadow-connection-manager": "^1.1.2",
+		"meadow": "^2.0.43",
+		"meadow-connection-manager": "^1.1.5",
 		"meadow-connection-mysql": "^1.0.19",
-		"meadow-endpoints": "^4.0.21",
-		"meadow-integration": "^1.0.40",
-		"meadow-migrationmanager": "^1.0.0",
+		"meadow-endpoints": "^4.0.22",
+		"meadow-integration": "^1.0.42",
+		"meadow-migrationmanager": "^1.0.4",
 		"orator": "^6.1.2",
 		"orator-http-proxy": "^1.0.5",
 		"orator-serviceserver-restify": "^2.0.11",
 		"orator-static-server": "^2.1.4",
 		"pict": "^1.0.372",
-		"pict-provider-theme": "^1.0.1",
+		"pict-provider-theme": "^1.1.2",
 		"pict-section-connection-form": "^1.0.0",
 		"pict-section-histogram": "^1.0.1",
 		"pict-section-modal": "^1.1.4",
-		"pict-section-theme": "^1.0.6",
+		"pict-section-theme": "^1.1.1",
 		"pict-sessionmanager": "^1.0.2",
-		"stricture": "^4.0.3"
+		"stricture": "^4.0.6"
 	},
 	"retold": {
 		"brand": {
