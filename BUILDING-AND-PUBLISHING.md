@@ -110,7 +110,7 @@ BUILD_DOCKER=1 npm publish    (or: npm run publish:docker)
   → postpublish: BUILD_DOCKER=1 → tag + push     ← image trigger
   → .github/workflows/publish-image.yml fires
   → docker buildx build linux/amd64,linux/arm64
-  → docker push ghcr.io/stevenvelozo/retold-data-service:<version>
+  → docker push ghcr.io/fable-retold/retold-data-service:<version>
 ```
 
 ---
@@ -119,7 +119,7 @@ BUILD_DOCKER=1 npm publish    (or: npm run publish:docker)
 
 1. **npm**: `npm view retold-data-service version`
 2. **Workflow**: `https://github.com/fable-retold/retold-data-service/actions`
-3. **Image**: `docker pull ghcr.io/stevenvelozo/retold-data-service:latest`
+3. **Image**: `docker pull ghcr.io/fable-retold/retold-data-service:latest`
 
 If the first `docker pull` returns `denied`, the package is private by
 default — flip visibility to public via Package Settings → Danger Zone
@@ -130,8 +130,8 @@ on the package page.
 ## Image consumption
 
 ```bash
-docker pull ghcr.io/stevenvelozo/retold-data-service:latest
-docker run --rm ghcr.io/stevenvelozo/retold-data-service:latest
+docker pull ghcr.io/fable-retold/retold-data-service:latest
+docker run --rm ghcr.io/fable-retold/retold-data-service:latest
 ```
 
 Configuration via env vars: see this module's README for the supported
