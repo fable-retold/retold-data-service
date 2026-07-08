@@ -16,6 +16,8 @@ module.exports = (pDataClonerService, pOratorServiceServer) =>
 
 	let libFs = require('fs');
 	let _ProviderRegistry = require('./DataCloner-ProviderRegistry.js');
+	let libIndexPolicy = require('meadow-integration/source/services/clone/Meadow-Service-IndexPolicy.js');
+	let libIndexConvergence = require('meadow-integration/source/services/clone/Meadow-Service-IndexConvergence.js');
 
 	// POST /clone/schema/fetch
 	// Accepts either:
@@ -889,7 +891,7 @@ module.exports = (pDataClonerService, pOratorServiceServer) =>
 			let tmpTableNames = tmpFilterTables || Object.keys(tmpModelTables);
 			let tmpCreatedIndices = [];
 
-			tmpFable.log.info(`Data Cloner: Creating missing GUID indices for ${tmpTableNames.length} tables...`);
+			tmpFable.log.info(`Data Cloner: Creating missing operational indices (GUID + sync) for ${tmpTableNames.length} tables...`);
 
 			tmpFable.Utility.eachLimit(tmpTableNames, 1,
 				(pTableName, fNextTable) =>
@@ -903,10 +905,15 @@ module.exports = (pDataClonerService, pOratorServiceServer) =>
 					// Generate all index statements for this table (provider-specific)
 					let tmpAllStatements = tmpSchemaProvider.generateCreateIndexStatements(tmpTableSchema);
 
-					// Filter to GUID indices only (AK_M_GUID*)
-					let tmpGUIDStatements = tmpAllStatements.filter((pStmt) => pStmt.Name && pStmt.Name.indexOf('AK_M_GUID') === 0);
+					// Filter to the clone's operational indices: GUID uniqueness
+					// (AK_M_GUID*) plus the standard sync indices (IX_M_SYNC*) that
+					// keep the OngoingEventualConsistency range-count / delete walks
+					// seekable.  Application ForeignKey / Indexed-column indices are
+					// intentionally left out of the clone.
+					let tmpCloneIndexStatements = tmpAllStatements.filter((pStmt) => pStmt.Name &&
+						(pStmt.Name.indexOf('AK_M_GUID') === 0 || pStmt.Name.indexOf('IX_M_SYNC') === 0));
 
-					if (tmpGUIDStatements.length < 1)
+					if (tmpCloneIndexStatements.length < 1)
 					{
 						return fNextTable();
 					}
@@ -914,12 +921,12 @@ module.exports = (pDataClonerService, pOratorServiceServer) =>
 					// createIndex is idempotent on all providers — safe to call even if index exists
 					let fCreateNext = (pIndex) =>
 					{
-						if (pIndex >= tmpGUIDStatements.length)
+						if (pIndex >= tmpCloneIndexStatements.length)
 						{
 							return fNextTable();
 						}
 
-						let tmpStmt = tmpGUIDStatements[pIndex];
+						let tmpStmt = tmpCloneIndexStatements[pIndex];
 						tmpSchemaProvider.createIndex(tmpStmt,
 							(pCreateError) =>
 							{
@@ -946,8 +953,8 @@ module.exports = (pDataClonerService, pOratorServiceServer) =>
 				() =>
 				{
 					let tmpMessage = tmpCreatedIndices.length > 0
-						? `${tmpCreatedIndices.length} GUID index(es) created.`
-						: 'No new GUID indices were needed.';
+						? `${tmpCreatedIndices.length} operational index(es) created.`
+						: 'No new operational indices were needed.';
 
 					tmpFable.log.info(`Data Cloner: ${tmpMessage}`);
 
@@ -955,6 +962,96 @@ module.exports = (pDataClonerService, pOratorServiceServer) =>
 						{
 							Success: true,
 							IndicesCreated: tmpCreatedIndices,
+							Message: tmpMessage
+						});
+					return fNext();
+				});
+		});
+
+	// POST /clone/schema/indices/converge — Converge each deployed table's indexes
+	// to the clone index policy (create missing, then drop undeclared per prune
+	// scope).  This is the authoritative, declarative index mechanism: the desired
+	// set = standard operational (Deleted composite + non-unique GUID) + any
+	// caller-declared per-table extras (body.IndexPolicy.TableIndexes).
+	pOratorServiceServer.post(`${tmpPrefix}/schema/indices/converge`,
+		(pRequest, pResponse, fNext) =>
+		{
+			if (!tmpCloneState.DeployedModelObject)
+			{
+				pResponse.send(400, { Success: false, Error: 'No schema deployed. Deploy tables first.' });
+				return fNext();
+			}
+
+			let tmpProviderName = tmpCloneState.ConnectionProvider;
+			let tmpProviderRegistryEntry = _ProviderRegistry[tmpProviderName];
+			let tmpActiveProvider = tmpProviderRegistryEntry ? tmpFable[tmpProviderRegistryEntry.serviceName] : null;
+
+			if (!tmpActiveProvider || !tmpActiveProvider.connected)
+			{
+				pResponse.send(400, { Success: false, Error: 'No connected provider available.' });
+				return fNext();
+			}
+
+			if (typeof(tmpActiveProvider.introspectTableIndices) !== 'function'
+				|| typeof(tmpActiveProvider.generateCreateIndexStatements) !== 'function'
+				|| typeof(tmpActiveProvider.createIndex) !== 'function'
+				|| typeof(tmpActiveProvider.dropIndex) !== 'function')
+			{
+				pResponse.send(400, { Success: false, Error: `Provider ${tmpProviderName} does not support index convergence.` });
+				return fNext();
+			}
+
+			let tmpBody = pRequest.body || {};
+			let tmpIndexConfig = (tmpBody.IndexPolicy && typeof(tmpBody.IndexPolicy) === 'object') ? tmpBody.IndexPolicy : {};
+			let tmpPruneScope = tmpIndexConfig.PruneScope || libIndexConvergence.PRUNE_MANAGED;
+			let tmpFilterTables = Array.isArray(tmpBody.Tables) && tmpBody.Tables.length > 0 ? tmpBody.Tables : null;
+
+			let tmpModelTables = tmpCloneState.DeployedModelObject.Tables || {};
+			let tmpTableNames = tmpFilterTables || Object.keys(tmpModelTables);
+			let tmpResults = [];
+
+			tmpFable.log.info(`Data Cloner: Converging indexes for ${tmpTableNames.length} tables (prune scope: ${tmpPruneScope})...`);
+
+			tmpFable.Utility.eachLimit(tmpTableNames, 1,
+				(pTableName, fNextTable) =>
+				{
+					let tmpTableSchema = tmpModelTables[pTableName];
+					if (!tmpTableSchema)
+					{
+						return fNextTable();
+					}
+
+					let tmpDesired = libIndexPolicy.resolveDesiredIndexes(tmpTableSchema, tmpIndexConfig);
+					libIndexConvergence.convergeTableIndexes(tmpActiveProvider, tmpTableSchema, tmpDesired,
+						{ PruneScope: tmpPruneScope, log: tmpFable.log },
+						(pConvergeError, pResult) =>
+						{
+							if (pConvergeError)
+							{
+								tmpFable.log.warn(`Data Cloner: Index convergence for ${pTableName} failed: ${pConvergeError}`);
+							}
+							else if (pResult && (pResult.created.length > 0 || pResult.dropped.length > 0 || pResult.skipped.length > 0))
+							{
+								tmpFable.log.info(`Data Cloner: ${pTableName} — created [${pResult.created.join(', ')}], dropped [${pResult.dropped.join(', ')}]${pResult.skipped.length > 0 ? `, skipped [${pResult.skipped.join(', ')}]` : ''}`);
+								tmpResults.push(pResult);
+							}
+							return fNextTable();
+						});
+				},
+				() =>
+				{
+					let tmpCreated = tmpResults.reduce((pSum, pR) => { return pSum + pR.created.length; }, 0);
+					let tmpDropped = tmpResults.reduce((pSum, pR) => { return pSum + pR.dropped.length; }, 0);
+					let tmpMessage = (tmpCreated > 0 || tmpDropped > 0)
+						? `Index convergence: ${tmpCreated} created, ${tmpDropped} dropped across ${tmpResults.length} table(s).`
+						: 'Index convergence: all tables already match the desired index set.';
+
+					tmpFable.log.info(`Data Cloner: ${tmpMessage}`);
+
+					pResponse.send(200,
+						{
+							Success: true,
+							Results: tmpResults,
 							Message: tmpMessage
 						});
 					return fNext();

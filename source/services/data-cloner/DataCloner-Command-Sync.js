@@ -20,6 +20,7 @@ const _RuntimeSyncProperties = {
 	MaxRecordsPerEntity:     (pVal) => { let tmpN = parseInt(pVal, 10); return (!isNaN(tmpN) && tmpN > 0) ? tmpN : null; },
 	DateTimePrecisionMS:     (pVal) => { let tmpN = parseInt(pVal, 10); return !isNaN(tmpN)               ? tmpN : null; },
 	TrueUpPageSize:          (pVal) => { let tmpN = parseInt(pVal, 10); return (!isNaN(tmpN) && tmpN > 0) ? tmpN : null; },
+	SyncRecordConcurrency:   (pVal) => { let tmpN = parseInt(pVal, 10); return (!isNaN(tmpN) && tmpN > 0) ? tmpN : null; },
 	UseAdvancedIDPagination: (pVal) => !!pVal,
 	SyncDeletedRecords:      (pVal) => !!pVal
 };
