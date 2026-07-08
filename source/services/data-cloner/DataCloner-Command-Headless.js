@@ -240,6 +240,46 @@ module.exports = (pDataClonerService, pConfig, pCLIOptions, fCallback) =>
 			});
 	};
 
+	// Step 5b: Converge each deployed table's indexes to the clone index policy.
+	//
+	// Historically nothing in the headless pipeline touched indices, so headless
+	// clones ran with just the clustered primary key — leaving the
+	// OngoingEventualConsistency Deleted-filtered range counts clustered-scanning
+	// wide rows, which can stall large clones.  This step declaratively brings the
+	// clone's indexes in line with the desired set (standard operational indexes +
+	// any Sync.IndexPolicy.TableIndexes extras): create missing, then drop
+	// undeclared per prune scope (default 'managed' — only policy-owned / legacy
+	// artifacts, never a hand-authored index).  Create-before-drop and
+	// no-loss-on-failure keep coverage intact.  It must never block the sync, so a
+	// failure here is logged and the pipeline proceeds.  Opt out with
+	// Sync.CreateOperationalIndices=false or Sync.IndexPolicy.Enabled=false.
+	let fStep5b_ConvergeIndices = (fNext) =>
+	{
+		let tmpSync = pConfig.Sync || {};
+		let tmpIndexPolicy = (tmpSync.IndexPolicy && typeof(tmpSync.IndexPolicy) === 'object') ? tmpSync.IndexPolicy : {};
+		if (tmpSync.CreateOperationalIndices === false || tmpIndexPolicy.Enabled === false)
+		{
+			tmpFable.log.info('Headless: Index convergence disabled by config; skipping.');
+			return fNext();
+		}
+
+		let tmpTables = pConfig.Tables || [];
+		tmpFable.log.info(`Headless: Converging indexes on ${tmpTables.length > 0 ? tmpTables.length + ' selected' : 'all'} tables (prune scope: ${tmpIndexPolicy.PruneScope || 'managed'})...`);
+		fPost(`${tmpPrefix}/schema/indices/converge`, { Tables: tmpTables, IndexPolicy: tmpIndexPolicy },
+			(pError, pData) =>
+			{
+				if (pError || !pData || !pData.Success)
+				{
+					tmpFable.log.warn(`Headless: Index convergence reported a problem (continuing to sync): ${pError || (pData && pData.Error) || 'Unknown error'}`);
+				}
+				else
+				{
+					tmpFable.log.info(`Headless: ${pData.Message}`);
+				}
+				return fNext();
+			});
+	};
+
 	// Step 6: Start sync
 	let fStep6_Sync = (fNext) =>
 	{
@@ -254,6 +294,7 @@ module.exports = (pDataClonerService, pConfig, pCLIOptions, fCallback) =>
 				DateTimePrecisionMS: tmpSync.DateTimePrecisionMS,
 				BackSyncTimeLimit: tmpSync.BackSyncTimeLimit,
 				TrueUpPageSize: tmpSync.TrueUpPageSize,
+				SyncRecordConcurrency: tmpSync.SyncRecordConcurrency,
 				SyncEntityOptions: tmpSync.SyncEntityOptions
 			});
 
@@ -267,6 +308,38 @@ module.exports = (pDataClonerService, pConfig, pCLIOptions, fCallback) =>
 					return fCallback(new Error('Sync start failed'));
 				}
 				tmpFable.log.info(`Headless: ${pData.Message}`);
+
+				// Stall detection.  Synced/Total freezes during the (time-budgeted)
+				// delete phase, so a healthy delete pass looks identical to a hung
+				// one from the poll's vantage point.  Only treat it as a stall when
+				// NOTHING in the status changes for well beyond one phase budget —
+				// default max(2x BackSyncTimeLimit, 20 min) — then exit non-zero so
+				// the Docker restart loop can recover (cursor/progress state persists
+				// on the mounted volume).  Configure via Sync.StallTimeoutMs; set it
+				// to 0 to disable.
+				let tmpStallConfigured = parseInt(tmpSync.StallTimeoutMs, 10);
+				let tmpStallTimeoutMs;
+				if (tmpStallConfigured === 0)
+				{
+					tmpStallTimeoutMs = 0;
+				}
+				else if (!isNaN(tmpStallConfigured) && tmpStallConfigured > 0)
+				{
+					tmpStallTimeoutMs = tmpStallConfigured;
+				}
+				else
+				{
+					let tmpBudget = parseInt(tmpSync.BackSyncTimeLimit, 10);
+					if (isNaN(tmpBudget) || tmpBudget <= 0)
+					{
+						tmpBudget = 600000;
+					}
+					tmpStallTimeoutMs = Math.max(2 * tmpBudget, 1200000);
+				}
+				let fLogStall = (typeof(tmpFable.log.fatal) === 'function') ? tmpFable.log.fatal.bind(tmpFable.log) : tmpFable.log.error.bind(tmpFable.log);
+				let tmpLastProgressSignature = null;
+				let tmpLastProgressAtMs = Date.now();
+				tmpFable.log.info(`Headless: Stall detector ${tmpStallTimeoutMs > 0 ? 'armed at ' + (tmpStallTimeoutMs / 60000).toFixed(1) + ' min of no observable progress' : 'disabled'}.`);
 
 				// Poll for completion
 				let fPoll = () =>
@@ -291,6 +364,27 @@ module.exports = (pDataClonerService, pConfig, pCLIOptions, fCallback) =>
 									let tmpA = tmpTables[tmpActive[0]];
 									tmpFable.log.info(`Headless: [${tmpDone.length}/${tmpNames.length}] Syncing ${tmpActive[0]}: ${tmpA.Synced}/${tmpA.Total}`);
 								}
+
+								// Advance the stall clock only when the observable status
+								// changes (any table's Status or Synced/Total counters).
+								let tmpProgressSignature = tmpNames.slice().sort().map((pName) =>
+									{
+										let tmpT = tmpTables[pName];
+										return `${pName}:${tmpT.Status}:${tmpT.Synced}/${tmpT.Total}`;
+									}).join('|');
+								let tmpNowMs = Date.now();
+								if (tmpProgressSignature !== tmpLastProgressSignature)
+								{
+									tmpLastProgressSignature = tmpProgressSignature;
+									tmpLastProgressAtMs = tmpNowMs;
+								}
+								else if (tmpStallTimeoutMs > 0 && (tmpNowMs - tmpLastProgressAtMs) >= tmpStallTimeoutMs)
+								{
+									let tmpStalledMin = ((tmpNowMs - tmpLastProgressAtMs) / 60000).toFixed(1);
+									fLogStall(`Headless: STALL DETECTED — sync status unchanged for ${tmpStalledMin} min (threshold ${(tmpStallTimeoutMs / 60000).toFixed(1)} min). Active: [${tmpActive.join(', ') || 'none'}], ${tmpDone.length}/${tmpNames.length} tables done. Exiting non-zero so the container restart loop can recover; cursor/progress state persists on the mounted volume.`);
+									return process.exit(1);
+								}
+
 								return setTimeout(fPoll, 5000);
 							}
 
@@ -347,10 +441,13 @@ module.exports = (pDataClonerService, pConfig, pCLIOptions, fCallback) =>
 				{
 					fStep5_Deploy(() =>
 					{
-						fStep6_Sync(() =>
+						fStep5b_ConvergeIndices(() =>
 						{
-							tmpFable.log.info('Headless: Pipeline complete.');
-							return fCallback();
+							fStep6_Sync(() =>
+							{
+								tmpFable.log.info('Headless: Pipeline complete.');
+								return fCallback();
+							});
 						});
 					});
 				});
