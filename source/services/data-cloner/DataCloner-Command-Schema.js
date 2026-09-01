@@ -1042,9 +1042,24 @@ module.exports = (pDataClonerService, pOratorServiceServer) =>
 				{
 					let tmpCreated = tmpResults.reduce((pSum, pR) => { return pSum + pR.created.length; }, 0);
 					let tmpDropped = tmpResults.reduce((pSum, pR) => { return pSum + pR.dropped.length; }, 0);
-					let tmpMessage = (tmpCreated > 0 || tmpDropped > 0)
-						? `Index convergence: ${tmpCreated} created, ${tmpDropped} dropped across ${tmpResults.length} table(s).`
-						: 'Index convergence: all tables already match the desired index set.';
+					// Skipped indexes are the ones convergence wanted and could not
+					// build. Rolling up created/dropped alone reported a table whose
+					// index failed on every attempt as "already match" — a clean
+					// all-clear for a clone that was missing an index for months.
+					let tmpSkipped = tmpResults.reduce((pSum, pR) => { return pSum + (pR.skipped ? pR.skipped.length : 0); }, 0);
+					let tmpMessage;
+					if (tmpSkipped > 0)
+					{
+						tmpMessage = `Index convergence: ${tmpCreated} created, ${tmpDropped} dropped, ${tmpSkipped} FAILED across ${tmpResults.length} table(s). The clone is missing indexes it wants — see the per-table warnings above.`;
+					}
+					else if (tmpCreated > 0 || tmpDropped > 0)
+					{
+						tmpMessage = `Index convergence: ${tmpCreated} created, ${tmpDropped} dropped across ${tmpResults.length} table(s).`;
+					}
+					else
+					{
+						tmpMessage = 'Index convergence: all tables already match the desired index set.';
+					}
 
 					tmpFable.log.info(`Data Cloner: ${tmpMessage}`);
 

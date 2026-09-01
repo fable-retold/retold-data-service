@@ -16,6 +16,7 @@ module.exports = (pDataClonerService, pConfig, pCLIOptions, fCallback) =>
 
 	let libFs = require('fs');
 	let libPath = require('path');
+	let libPipelineWatchdog = require('./DataCloner-PipelineWatchdog.js');
 
 	pConfig = pDataClonerService.normalizeConfig(pConfig);
 
@@ -98,6 +99,28 @@ module.exports = (pDataClonerService, pConfig, pCLIOptions, fCallback) =>
 	};
 
 	let tmpPrefix = pDataClonerService.routePrefix;
+
+	// Guard every step before the sync -- connect, session, auth, schema fetch,
+	// deploy, index convergence -- none of which the fStep6 stall detector can
+	// see.  A wedged 8MB schema GET once held a customer's clone for twelve
+	// days precisely here: the process stayed alive, never exited non-zero, and
+	// the restart loop never fired.  See DataCloner-PipelineWatchdog for why
+	// this watches for silence rather than enforcing a deadline.
+	let tmpPipelineWatchdog = libPipelineWatchdog(tmpFable, (pConfig.Sync || {}).PipelineStallTimeoutMs);
+
+	// Every exit disarms, by construction rather than by remembering to at ten
+	// call sites.  This matters as much as the arming does: the bin idles for
+	// --delay seconds after a successful run (900s in production), a longer
+	// silence than any live step, and an armed watchdog would turn every
+	// success into an exit 1.
+	let fPipelineCallback = fCallback;
+	fCallback = (pPipelineError) =>
+	{
+		tmpPipelineWatchdog.disarm();
+		return fPipelineCallback(pPipelineError);
+	};
+
+	tmpPipelineWatchdog.arm();
 
 	// Step 1: Connect local database
 	let fStep1_ConnectDB = (fNext) =>
