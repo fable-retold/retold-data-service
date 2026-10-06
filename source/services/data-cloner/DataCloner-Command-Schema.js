@@ -401,8 +401,10 @@ module.exports = (pDataClonerService, pOratorServiceServer) =>
 
 					tmpFable.log.info(`Data Cloner: Checking schema deltas for ${tmpTableNames.length} tables against ${tmpProviderName}...`);
 
-					tmpFable.Utility.eachLimit(tmpTableNames, 1,
-						(pTableName, fNextTable) =>
+					// Columns each table's provider claimed via migrateColumns, so they
+					// never reach the generic ALTER path below (see fCheckTableDeltas).
+					let tmpProviderClaimed = {};
+					let fCheckTableDeltas = (pTableName, fNextTable) =>
 						{
 							if (typeof(tmpActiveProvider.introspectTableColumns) !== 'function')
 							{
@@ -426,6 +428,46 @@ module.exports = (pDataClonerService, pOratorServiceServer) =>
 									let tmpTargetSchema = tmpMM.normalizeSchemaForDiff({ Tables: { [pTableName]: tmpModelObject.Tables[pTableName] } });
 
 									let tmpDiff = tmpMM._schemaDiff.diffSchemas(tmpSourceSchema, tmpTargetSchema);
+									let tmpTableMod = (tmpDiff.TablesModified || [])[0];
+									let tmpColumnMods = (tmpTableMod && Array.isArray(tmpTableMod.ColumnsModified)) ? tmpTableMod.ColumnsModified : [];
+
+									// Some column changes cannot be expressed as a portable
+									// ALTER (e.g. retyping an MSSQL identity key needs a table
+									// rebuild).  Providers that know how implement
+									// migrateColumns; offer them the table's modifications
+									// once, then re-check what is left.
+									if (!tmpProviderClaimed[pTableName] && (tmpColumnMods.length > 0) && (typeof(tmpActiveProvider.migrateColumns) === 'function'))
+									{
+										return tmpActiveProvider.migrateColumns(pTableName, tmpColumnMods,
+											(pMigrateError, pMigrateResult) =>
+											{
+												let tmpHandled = (pMigrateResult && Array.isArray(pMigrateResult.Handled)) ? pMigrateResult.Handled : [];
+												tmpProviderClaimed[pTableName] = tmpHandled;
+												if (pMigrateError)
+												{
+													tmpFable.log.error(`Data Cloner: ${tmpProviderName} could not migrate ${pTableName} column(s) [${tmpHandled.join(', ')}]: ${pMigrateError.message || pMigrateError}`);
+												}
+												else if (tmpHandled.length > 0)
+												{
+													tmpFable.log.info(`Data Cloner: ${tmpProviderName} migrated ${pTableName} column(s) [${tmpHandled.join(', ')}].`);
+													tmpMigrationResults.push(
+														{
+															Table: pTableName,
+															ColumnsAdded: [],
+															ColumnsModified: tmpHandled,
+															ProviderResult: pMigrateResult.Result,
+															Statements: []
+														});
+												}
+												return fCheckTableDeltas(pTableName, fNextTable);
+											});
+									}
+									// Whatever the provider claimed is its responsibility, done
+									// or failed; a generic ALTER would not be the right fix.
+									if (tmpTableMod && tmpProviderClaimed[pTableName] && tmpProviderClaimed[pTableName].length > 0)
+									{
+										tmpTableMod.ColumnsModified = tmpColumnMods.filter((pColMod) => tmpProviderClaimed[pTableName].indexOf(pColMod.Column) < 0);
+									}
 
 									let tmpColumnsAdded = [];
 									let tmpColumnsModified = [];
@@ -733,7 +775,9 @@ module.exports = (pDataClonerService, pOratorServiceServer) =>
 
 									fExecNext(0);
 								});
-						},
+						};
+
+					tmpFable.Utility.eachLimit(tmpTableNames, 1, fCheckTableDeltas,
 						() =>
 						{
 							if (tmpMigrationResults.length > 0)
